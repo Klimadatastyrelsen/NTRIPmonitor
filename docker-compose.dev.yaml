@@ -68,6 +68,10 @@ services:
 
     ingest:
         image: ${NTRIP_DOCKER_REGISTRY}
+        # multiprocessing.Manager() needs a writable /tmp
+        read_only: true
+        tmpfs:
+            - /tmp
         env_file:
             - .env
         depends_on:
