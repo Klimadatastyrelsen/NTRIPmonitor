@@ -29,3 +29,4 @@ class MultiprocessingSettings:
     readersPerDecoder: int = None
     clearCheck: float = None
     appendCheck: float = None
+    sourcetableRefresh: int = None

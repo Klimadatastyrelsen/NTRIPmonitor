@@ -513,6 +513,7 @@ async def downloadSourceTable(
             )
         else:
             seenMountpoints[mountpoint[0]] = mountpoint
+    dbConnection = None
     while True:
         try:
             dbConnection = await dbConnect(dbSettings)
@@ -546,6 +547,20 @@ async def downloadSourceTable(
     if dbConnection:
         await dbConnection.close()
     return casterStatus
+
+
+async def periodicSourceTableRefresh(
+    casterSettingsDict: dict, dbSettings: DbSettings, interval: int
+) -> None:
+    """Re-reads the sourcetable, so mountpoints that come online after start
+    get their metadata in sourcetable_constants and show up in the dashboards.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await downloadSourceTable(casterSettingsDict, dbSettings)
+        except Exception as error:
+            logging.error(f"Sourcetable refresh failed, retrying in {interval} s: {error}")
 
 
 def loadCasterSettings():
@@ -813,6 +828,12 @@ def RunMultiProcessing(
         # here we set up a main asyncio loop, which takes care of signal handling and passing on 
         loop = asyncio.new_event_loop()
         signal_handler = SignalHandler(loop, readingProcesses + decoderProcesses)
+        if processingSettings.sourcetableRefresh > 0:
+            loop.create_task(
+                periodicSourceTableRefresh(
+                    casterSettingsDict, dbSettings, processingSettings.sourcetableRefresh
+                )
+            )
         # we run forever until the process is interrupted/killed from OS
         loop.run_forever()
         logging.debug(f"Main asyncio loop {id(loop)} ended. Joining processes.")
@@ -954,6 +975,8 @@ if __name__ == "__main__":
     processingSettings.appendCheck = float(
         os.getenv("APPEND_CHECK")
     )  # Currently un-used. Will be used for appending shared list.
+    # Seconds between sourcetable re-reads; 0 reads it at start only
+    processingSettings.sourcetableRefresh = int(os.getenv("SOURCETABLE_REFRESH", "600"))
 
     # If test mode is enabled, don't use database settings
     if args.test:
