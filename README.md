@@ -148,6 +148,7 @@ The number of cores the system will use is set in the environment file.
 - **READERS_PER_DECODER** - INTEGER: How many reader processes should share a decoder process. Each decoder is granted a CPU core, if adequate resources are available.
 - **CLEAR_CHECK** - FLOAT: The time interval at which each decoder process will check the shared memory for new data entries.
 - **APPEND_CHECK** - FLOAT: The time interval each reader process will append to the shared memory when receiving data.
+- **SOURCETABLE_REFRESH** - INTEGER: Seconds between re-reads of the caster sourcetables, so mountpoints that come online after start appear in the dashboards. Default 600; 0 reads the sourcetables at start only.
 - **INGEST_CPU** - FLOAT: Number of CPU the application has access to. The application will not block other applications from using the allocated CPU's, but the application may, if required at times, use this amount of CPU's.
 - **INGEST_MEMORY** - INTEGER + GB : The amount of memory the application has access to. Similar to the CPU, the application will not block other applications from using the allocated memory, but the application may, if required at times, use this amount of memory.
 ### Multiprocessing - Reading processes
