@@ -47,7 +47,10 @@ jobs:
               "SELECT 1 FROM pg_proc WHERE proname = 'update_reconnect_log'" 2>/dev/null | grep -q 1 && break
             sleep 2
           done
-          if docker logs db 2>&1 | grep -q "psql:/docker-entrypoint-initdb.d/.*ERROR"; then
+          # Logs go through a variable: grep -q on a pipe exits at the first match, docker logs
+          # then dies from SIGPIPE, and pipefail turns the match into a failure.
+          dblogs=$(docker logs db 2>&1)
+          if grep -q "psql:/docker-entrypoint-initdb.d/.*ERROR" <<<"$dblogs"; then
             echo "::error::initdb/ failed to apply"
             docker logs db
             exit 1
@@ -62,19 +65,21 @@ jobs:
             -e FIRST_CASTER_USER=smoke -e FIRST_CASTER_PASSWORD=smoke -e FIRST_CASTER_MOUNTPOINT=SMOKE \
             ntripmonitor:ci
           for attempt in $(seq 1 30); do
-            docker logs ingest 2>&1 | grep -q "Requesting source table" && break
+            logs=$(docker logs ingest 2>&1)
+            grep -q "Requesting source table" <<<"$logs" && break
             sleep 2
           done
-          docker logs ingest
-          if ! docker logs ingest 2>&1 | grep -q "Database is initialized"; then
+          logs=$(docker logs ingest 2>&1)
+          echo "$logs"
+          if ! grep -q "Database is initialized" <<<"$logs"; then
             echo "::error::ingest did not connect to the database"
             exit 1
           fi
-          if ! docker logs ingest 2>&1 | grep -q "Requesting source table"; then
+          if ! grep -q "Requesting source table" <<<"$logs"; then
             echo "::error::ingest did not get past start-up"
             exit 1
           fi
-          if docker logs ingest 2>&1 | grep -q -E "Traceback|Read-only file system|Permission denied"; then
+          if grep -q -E "Traceback|Read-only file system|Permission denied" <<<"$logs"; then
             echo "::error::ingest failed under a read-only root filesystem"
             exit 1
           fi
