@@ -28,10 +28,16 @@ class DatabaseHandler:
                 break
             except Exception as error:
                 logging.error(f"Failed to create connection pool with: {error}")
+                await asyncio.sleep(5)
 
-    async def closePool(self):
+    async def closePool(self, timeout: float = 10):
+        # Pool.close() waits forever for unreleased connections
         if self.pool:
-            await self.pool.close()
+            try:
+                await asyncio.wait_for(self.pool.close(), timeout)
+            except Exception as error:
+                logging.warning(f"Pool close failed, terminating: {error!r}")
+                self.pool.terminate()
 
     async def getConnection(self):
         if not self.pool:
@@ -224,20 +230,15 @@ class NtripLogHandler(DatabaseHandler):
             gmtime(timestamp),
         )
 
+        # A DB outage must not end the stream task, so log and carry on
         try:
-            connection = await self.getConnection()
-            result = await connection.fetchval(
-                """
-                SELECT insert_disconnect_log($1::json)
-            """,
-                json.dumps([self.mountpoint, disconnect_time]),
-            )
-            self.disconnect_id = result
-            await self.releaseConnection(connection)
-        except asyncpg.exceptions.UndefinedFunctionError as e:
-            logging.error(
-                f"Could not update disconnect log. Stored procedure not found: {e}."
-            )
+            async with self.pool.acquire() as connection:
+                self.disconnect_id = await connection.fetchval(
+                    "SELECT insert_disconnect_log($1::json)",
+                    json.dumps([self.mountpoint, disconnect_time]),
+                )
+        except Exception as error:
+            logging.error(f"{self.mountpoint}: Could not insert disconnect log: {error!r}")
 
     async def update_reconnect_log(self):
         timestamp = time()
@@ -246,19 +247,14 @@ class NtripLogHandler(DatabaseHandler):
             gmtime(timestamp),
         )
         try:
-            connection = await self.getConnection()
-            await connection.execute(
-                """
-                SELECT update_reconnect_log($1::json)
-            """,
-                json.dumps([self.disconnect_id, reconnect_time]),
-            )
-            self.disconnect_id = None
-            await self.releaseConnection(connection)
-        except asyncpg.exceptions.UndefinedFunctionError as e:
-            logging.error(
-                f"Could not update reconnect log. Stored procedure not found: {e}"
-            )
+            async with self.pool.acquire() as connection:
+                await connection.execute(
+                    "SELECT update_reconnect_log($1::json)",
+                    json.dumps([self.disconnect_id, reconnect_time]),
+                )
+        except Exception as error:
+            logging.error(f"{self.mountpoint}: Could not update reconnect log: {error!r}")
+        self.disconnect_id = None
 
     async def requestStream(
         self,

@@ -180,6 +180,9 @@ The decoder process in simple terms:
 - The data is packed in a JSON format and sent to the database through a stored procedure. The stored procedures to use is determined by the table string. 
 - Repeat
 
+### Multiprocessing - Health and restarts
+Every reader and decoder process touches a heartbeat file in `HEARTBEAT_DIR` (default `/tmp`) every 30 seconds from its event loop. The main process checks them every 30 seconds. If a child has exited, or its heartbeat is older than `HEARTBEAT_TIMEOUT` seconds (default 300), the main process shuts down the rest and exits with code 1, so the container restarts with all processes. While all children are fine, the main process touches `ntripmonitor-alive` in the same directory, which [src/healthcheck.py](src/healthcheck.py) checks as a liveness probe (`python3 /app/healthcheck.py [max age, default 120]`).
+
 ## Disconnect/Reconnect log handling
 Disconnects and reconnects of individual mountpoints are currently handled in the [src/databasehandling.py](NtripLogHandler) class.
 Mountpoint disconnects are logged and timestamps are inserted into the database table [initdb/30-connection_logger.sql](initdb/30-connection_logger.sql).
