@@ -59,12 +59,15 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- if .Values.volumeMounts }}
           volumeMounts:
+            # Heartbeat files and the multiprocessing.Manager socket; works with a read-only root fs
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.volumeMounts }}
             - name: {{ .Values.volumeMounts.name }}
               mountPath: {{ .Values.volumeMounts.mountPath }}
               readOnly: false
-          {{- end }}
+            {{- end }}
           envFrom:
             - configMapRef:
                 name: ntripmonitor-env
@@ -74,10 +77,13 @@ spec:
                 secretKeyRef:
                   name: "{{ .Values.timescaledb.name }}-app"
                   key: password
-      {{- with .Values.volumes }}
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- with .Values.volumes }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
