@@ -43,14 +43,17 @@ spec:
             - name: http
               containerPort: 80
               protocol: TCP
+          # Startup waits for the database and sourcetable; liveness then fails once the
+          # main process stops confirming that all reader and decoder processes are alive.
+          startupProbe:
+            exec:
+              command: ["python3", "/app/healthcheck.py"]
+            periodSeconds: 10
+            failureThreshold: 60
           livenessProbe:
             exec:
-              command:
-                - sh
-                - -c
-                - "ps aux | grep -q '[p]ython3' || exit 1"
-            initialDelaySeconds: 15
-            periodSeconds: 20
+              command: ["python3", "/app/healthcheck.py"]
+            periodSeconds: 30
             failureThreshold: 3
           {{- with .Values.resources }}
           resources:

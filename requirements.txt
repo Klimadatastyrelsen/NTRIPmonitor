@@ -1,3 +1,3 @@
-bitstring
+bitstring<5
 asyncpg
 python-dotenv

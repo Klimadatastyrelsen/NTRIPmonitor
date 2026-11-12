@@ -21,6 +21,7 @@ import json
 import logging
 import signal
 import os
+import sys
 from argparse import ArgumentParser
 from configparser import ConfigParser
 import math
@@ -39,22 +40,40 @@ from rtcm3 import Rtcm3
 
 INIT_GRACEFUL_SHUTDOWN = False
 
+# Children touch a heartbeat file from their event loop; the main process exits when a
+# child dies or goes silent, and touches ALIVE_FILE for the liveness probe (healthcheck.py).
+HEARTBEAT_DIR = os.getenv("HEARTBEAT_DIR", "/tmp")
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "300"))
+ALIVE_FILE = os.path.join(HEARTBEAT_DIR, "ntripmonitor-alive")
+
+
+def touchHeartbeat(path: str) -> None:
+    with open(path, "a"):
+        pass
+    os.utime(path)
+
 class SignalHandler:
     """Signal handler for graceful shutdown"""
 
     def __init__(self, loop, processes = list[Process]):
         self.loop = loop
         self.processes = processes
+        self.exitCode = 0
         for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
             self.loop.add_signal_handler(sig, self.shutdown, sig)
 
-    def shutdown(self, sig: signal.Signals) -> None:
-        logging.info(f"Received signal {sig.name}. Initiating graceful shutdown.")
+    def shutdown(self, sig: signal.Signals | None) -> None:
+        if sig is not None:
+            logging.info(f"Received signal {sig.name}. Initiating graceful shutdown.")
         global INIT_GRACEFUL_SHUTDOWN
         INIT_GRACEFUL_SHUTDOWN = True
         for proc in self.processes:
-            proc.pipe_write.send(1)
-        
+            try:
+                proc.pipe_write.send(1)
+            except OSError:
+                pass
+
         self.loop.stop()
 
 
@@ -67,29 +86,23 @@ async def watchdogHandler(
 ) -> None:
     try:
         while not INIT_GRACEFUL_SHUTDOWN:
-            runningTasks = asyncio.all_tasks()
-            runningTasks = [task for task in runningTasks if task.get_name() != "watchdog"]
-            runningTaskNames = [runningTask.get_name() for runningTask in runningTasks]
+            # Restart every mountpoint task that has ended
+            for casterId, mountpoint in mountPointList:
+                task = tasks.get(mountpoint)
+                if task is None or task.done():
+                    casterSettings = casterSettingsDict[casterId]
+                    tasks[mountpoint] = asyncio.create_task(
+                        procRtcmStream(
+                            casterSettings,
+                            dbSettings,
+                            mountpoint,
+                            lock,
+                            sharedEncoded,
+                        ),
+                        name=mountpoint,
+                    )
+                    logging.warning(f"{mountpoint} RTCM stream restarted.")
 
-            if len(runningTasks) <= len(mountPointList):
-                logging.debug(f"{runningTaskNames} tasks running, {mountPointList} wanted.")
-                # For each desired task
-                for wantedTask in mountPointList:
-                    casterId, mountpoint = wantedTask
-                    if mountpoint not in runningTaskNames:
-                        casterSettings = casterSettingsDict[casterId]
-                        tasks[mountpoint] = asyncio.create_task(
-                            procRtcmStream(
-                                casterSettings,
-                                dbSettings,
-                                mountpoint,
-                                lock,
-                                sharedEncoded,
-                            ),
-                            name=mountpoint,
-                        )
-                        logging.warning(f"{mountpoint} RTCM stream restarted.")
-            
             await asyncio.sleep(30)  # Sleep for 30 seconds
     except asyncio.CancelledError:
         logging.debug(f"Watchdog on loop {id(asyncio.get_running_loop())} closed.") 
@@ -104,12 +117,14 @@ async def decodeInsertConsumer(
     dbSettings,
     lock,
     pipe_read: Connection,
+    heartbeatPath: str,
     fail: int = 0,
     retry: int = 3,
     checkInterval: float = 0.1,
 ):
     dBHandler = None
     rtcmMessage = Rtcm3()
+    lastHeartbeat = 0.0
 
     while True:
         try:
@@ -136,6 +151,9 @@ async def decodeInsertConsumer(
     try:
         while not pipe_read.poll():
             await asyncio.sleep(checkInterval)
+            if time() - lastHeartbeat > HEARTBEAT_INTERVAL:
+                touchHeartbeat(heartbeatPath)
+                lastHeartbeat = time()
             if sharedEncoded:
                 lock.acquire()
                 # Perform the list and clearList operations directly in the asyncio event loop
@@ -334,7 +352,8 @@ async def procRtcmStream(
                 ntripclient = await ntripLogger.requestStream(
                     ntripclient, casterSettings, log_disconnect=True
                 )
-    except:
+    except Exception as error:
+        logging.error(f"{mountPoint}: RTCM stream task failed: {error!r}")
         await ntripLogger.closePool()
 
     # we end here by closing the connection
@@ -354,7 +373,8 @@ async def rtcmStreamTasks(
     mountPointList: list,
     sharedEncoded: list,
     lock,
-    pipe_read: Connection
+    pipe_read: Connection,
+    heartbeatPath: str,
 ) -> None:
     tasks = {}
     for casterId, mountpoint in mountPointList:
@@ -376,7 +396,11 @@ async def rtcmStreamTasks(
     )
 
     # We wait until a signal is sent
+    lastHeartbeat = 0.0
     while not pipe_read.poll():
+        if time() - lastHeartbeat > HEARTBEAT_INTERVAL:
+            touchHeartbeat(heartbeatPath)
+            lastHeartbeat = time()
         await asyncio.sleep(1)
     logging.debug(f"Reader process on loop {id(asyncio.get_running_loop())} received shutdown signal.")
     global INIT_GRACEFUL_SHUTDOWN
@@ -713,6 +737,7 @@ class parallelProcess:
             pass
 
         self.pipe_read, self.pipe_write = Pipe(duplex=False)
+        self.startTime = time()
         self.process = Process(target=self.run)
         self.process.start()
 
@@ -731,7 +756,9 @@ class readerProcess(parallelProcess):
         mountpointChunk: list,
         sharedEncoded,
         lock: Lock,
+        heartbeatPath: str,
     ):
+        self.heartbeatPath = heartbeatPath
         self.caster = casterSettingsDict
         self.database = dbSettings
         self.mountpoints = mountpointChunk
@@ -741,7 +768,13 @@ class readerProcess(parallelProcess):
     def run(self):
         asyncio.run(
             rtcmStreamTasks(
-                self.caster, self.database, self.mountpoints, self.shared, self.lock, self.pipe_read
+                self.caster,
+                self.database,
+                self.mountpoints,
+                self.shared,
+                self.lock,
+                self.pipe_read,
+                self.heartbeatPath,
             )
         )
 
@@ -750,36 +783,48 @@ class readerProcess(parallelProcess):
 
 
 class decoderProcess(parallelProcess):
-    def __init__(self, dbSettings: DbSettings, sharedEncoded, lock: Lock):
+    def __init__(self, dbSettings: DbSettings, sharedEncoded, lock: Lock, heartbeatPath: str):
+        self.heartbeatPath = heartbeatPath
         self.database = dbSettings
         self.shared = sharedEncoded
         self.lock = lock
 
     def run(self):
-        asyncio.run(decodeInsertConsumer(self.shared, self.database, self.lock, self.pipe_read))
+        asyncio.run(
+            decodeInsertConsumer(
+                self.shared, self.database, self.lock, self.pipe_read, self.heartbeatPath
+            )
+        )
 
     def __repr__(self):
         return f"Decoder with shared memory {hex(id(self.shared))}"
 
-async def processWatcher(processes: list[parallelProcess]) -> None:
-    """
-    Checks threads periodically for crashes
-    """
-    logging.info(f"Introducing watcher for {processes}")
+async def childWatcher(
+    processes: list[parallelProcess], signalHandler: SignalHandler
+) -> None:
+    """Shuts down the main process when a child has died or its heartbeat is stale, so the
+    container exits and Kubernetes restarts it. Touches ALIVE_FILE while all is well."""
+    touchHeartbeat(ALIVE_FILE)
     while True:
-        # Wait 300 seconds between checking processes for aliveness
-        await asyncio.sleep(300)
-
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        now = time()
         for proc in processes:
             exitcode = proc.process.exitcode
-            logging.debug(
-                f"Checking process {proc} {proc.process} which has exit_code {exitcode}."
-            )
             if exitcode is not None:
-                logging.warning(
-                    f"Restarting process {proc} {proc.process} with un-expected exit_code {exitcode}."
-                )
-                proc.start()
+                reason = f"exited with code {exitcode}"
+            else:
+                try:
+                    age = now - os.path.getmtime(proc.heartbeatPath)
+                except OSError:
+                    age = now - proc.startTime
+                if age <= HEARTBEAT_TIMEOUT:
+                    continue
+                reason = f"has no heartbeat for {int(age)} s"
+            logging.error(f"{proc} {reason}. Shutting down.")
+            signalHandler.exitCode = 1
+            signalHandler.shutdown(None)
+            return
+        touchHeartbeat(ALIVE_FILE)
 
 
 def RunMultiProcessing(
@@ -808,6 +853,7 @@ def RunMultiProcessing(
                 mountpointChunk,
                 sharedEncoded,
                 lock,
+                os.path.join(HEARTBEAT_DIR, f"ntripmonitor-reader-{i}"),
             )
             logging.info(
                 f"Starting process {i+1} with {len(mountpointChunk)} mountpoints:"
@@ -816,8 +862,13 @@ def RunMultiProcessing(
             readingProcesses.append(readingProcess)
 
         decoderProcesses = []
-        for sharedEncoded, lock in zip(sharedEncodedList, lockList):
-            decodingProcess = decoderProcess(dbSettings, sharedEncoded, lock)
+        for i, (sharedEncoded, lock) in enumerate(zip(sharedEncodedList, lockList)):
+            decodingProcess = decoderProcess(
+                dbSettings,
+                sharedEncoded,
+                lock,
+                os.path.join(HEARTBEAT_DIR, f"ntripmonitor-decoder-{i}"),
+            )
             decoderProcesses.append(decodingProcess)
 
         for readingProcess in readingProcesses:
@@ -828,6 +879,7 @@ def RunMultiProcessing(
         # here we set up a main asyncio loop, which takes care of signal handling and passing on 
         loop = asyncio.new_event_loop()
         signal_handler = SignalHandler(loop, readingProcesses + decoderProcesses)
+        loop.create_task(childWatcher(readingProcesses + decoderProcesses, signal_handler))
         if processingSettings.sourcetableRefresh > 0:
             loop.create_task(
                 periodicSourceTableRefresh(
@@ -838,12 +890,19 @@ def RunMultiProcessing(
         loop.run_forever()
         logging.debug(f"Main asyncio loop {id(loop)} ended. Joining processes.")
 
-        for readingProcess in readingProcesses:
-            readingProcess.join()
-        for decodingProcess in decoderProcesses:
-            decodingProcess.join()
+        # A reader can hang on a lock held by a dead decoder, so do not wait forever
+        for proc in readingProcesses + decoderProcesses:
+            proc.process.join(timeout=15)
+            if proc.process.exitcode is None:
+                logging.warning(f"Terminating {proc}.")
+                proc.process.terminate()
+                proc.process.join(timeout=5)
+                if proc.process.exitcode is None:
+                    proc.process.kill()
+                    proc.process.join()
 
         logging.info(f"Goodbye!")
+    return signal_handler.exitCode
 
 
 
@@ -881,7 +940,7 @@ def main(
     casterSettingsDict = reduceCasterDict(casterSettingsDict, casterStatus)
 
     if processingSettings.multiprocessingActive:
-        RunMultiProcessing(casterSettingsDict, dbSettings, processingSettings)
+        sys.exit(RunMultiProcessing(casterSettingsDict, dbSettings, processingSettings))
     else:
         runSingleProcessing(casterSettingsDict, dbSettings)
         # Single-core version pulled due to bugs after introducing new class handling. Re-introduced soon.
